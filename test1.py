@@ -6,7 +6,7 @@ import aiohttp
 import orjson # Using orjson for faster JSON operations
 import nest_asyncio
 import logging
-import pyperclip # Note: pyperclip might not be needed if st_copy handles clipboard directly
+# import pyperclip # Note: pyperclip might not be needed if st_copy handles clipboard directly - REMOVED
 import json
 from typing import List, Dict, Set, Optional, Tuple
 from urllib.parse import urlparse, urljoin, urlunparse
@@ -443,7 +443,7 @@ class URLChecker:
         if 500 <= status_code < 600: return "Server Error"
         return "Unknown"
 
-    def parse_html_content(self, data: Dict, content: str, headers: Dict): # headers removed, use data["X-Robots-Tag"]
+    def parse_html_content(self, data: Dict, content: str, headers: Dict): # headers argument is present but not explicitly used in this version, data["X-Robots-Tag"] is used from data dict
         """Parse HTML content and extract metadata. Modifies data dict in-place."""
         try:
             soup = BeautifulSoup(content, "lxml") # Using lxml for speed
@@ -483,31 +483,38 @@ class URLChecker:
     def update_indexability_from_directives(self, data: Dict):
         """Updates 'Indexable' and 'Indexability Reason' based on Meta Robots and X-Robots-Tag."""
         # If already set to No (e.g. by robots.txt or HTTP error), don't override unless it's a more specific "noindex"
-        if data["Indexable"] == "No" and "directive" not in data["Indexability Reason"]: # Allow override if current reason isn't a directive
-            pass # Keep current non-indexable status
+        if data["Indexable"] == "No" and "directive" not in data["Indexability Reason"].lower() and "canonical" not in data["Indexability Reason"].lower() : # Allow override if current reason isn't a directive or canonical issue
+            pass # Keep current non-indexable status like "HTTP Error" or "Blocked by robots.txt"
 
         meta_robots = data["Meta Robots"].lower()
         x_robots = data["X-Robots-Tag"].lower()
 
+        # Check for explicit noindex directives first
         if "noindex" in meta_robots:
             data["Indexable"] = "No"
             data["Indexability Reason"] = "Meta Robots: noindex"
-        elif "noindex" in x_robots:
+            return # noindex is definitive
+        if "noindex" in x_robots:
             data["Indexable"] = "No"
             data["Indexability Reason"] = "X-Robots-Tag: noindex"
-        # Add other checks like "none" which implies noindex, nofollow
-        elif "none" in meta_robots:
+            return # noindex is definitive
+        if "none" in meta_robots: # "none" implies "noindex, nofollow"
             data["Indexable"] = "No"
             data["Indexability Reason"] = "Meta Robots: none"
-        elif "none" in x_robots:
+            return
+        if "none" in x_robots:
             data["Indexable"] = "No"
             data["Indexability Reason"] = "X-Robots-Tag: none"
-        # If canonical points elsewhere and it's not self-referential (and page is otherwise indexable)
-        elif data["Canonical_URL"] and data["Canonical_URL"] != data["Final_URL"] and data["Indexable"] == "Yes":
-            data["Indexable"] = "No" # Or "Considered Non-Indexable"
-            data["Indexability Reason"] = "Canonical to other URL"
-        elif data["Indexable"] == "Yes": # If no "noindex" and still "Yes"
-             data["Indexability Reason"] = "Indexable" # Default reason for indexable pages
+            return
+
+        # If page is otherwise considered indexable so far (e.g. HTTP 200, not robots blocked)
+        # then check canonical.
+        if data["Indexable"] == "Yes":
+            if data["Canonical_URL"] and normalize_url(data["Canonical_URL"]) != normalize_url(data["Final_URL"]):
+                data["Indexable"] = "No" # Or "Considered Non-Indexable" / "Points to Canonical"
+                data["Indexability Reason"] = "Canonical to other URL"
+            else: # It's indexable and either no canonical or self-referential canonical
+                 data["Indexability Reason"] = "Indexable" # Default reason for indexable pages
 
 
     def stop(self):
@@ -565,22 +572,24 @@ async def dynamic_frontier_crawl(
         robots_sitemaps = await fetch_sitemaps_from_robots(f"{urlparse(normalized_seed_url).scheme}://{base_netloc}", checker.session)
         sitemap_urls_to_process.extend(robots_sitemaps)
         # Optionally, could add common sitemap paths like /sitemap.xml if not found
-        if not sitemap_urls_to_process:
-            common_sitemap = urljoin(f"{urlparse(normalized_seed_url).scheme}://{base_netloc}", "sitemap.xml")
+        if not sitemap_urls_to_process: # Only if robots.txt didn't yield any
+            common_sitemap_path = urljoin(f"{urlparse(normalized_seed_url).scheme}://{base_netloc}", "sitemap.xml")
             # Basic check if this common sitemap exists before adding
             try:
-                async with checker.session.head(common_sitemap, timeout=5, ssl=False) as sitemap_resp:
+                # Use HEAD request to check existence without downloading full sitemap
+                async with checker.session.head(common_sitemap_path, timeout=aiohttp.ClientTimeout(total=5), ssl=False, allow_redirects=False) as sitemap_resp:
                     if sitemap_resp.status == 200:
-                        sitemap_urls_to_process.append(common_sitemap)
-                        logging.info(f"Added common sitemap: {common_sitemap}")
+                        sitemap_urls_to_process.append(common_sitemap_path)
+                        logging.info(f"Added common sitemap path for checking: {common_sitemap_path}")
             except Exception as e:
-                logging.warning(f"Could not check for common sitemap {common_sitemap}: {e}")
+                logging.warning(f"Could not HEAD check for common sitemap {common_sitemap_path}: {e}")
 
 
         if sitemap_urls_to_process:
             logging.info(f"Found/Added sitemap URLs for processing: {sitemap_urls_to_process}")
             # Process these sitemaps to extract URLs
-            extracted_sitemap_links = await process_sitemaps(sitemap_urls_to_process, checker.session, show_partial_sitemap_callback=None) # No UI callback here
+            # The show_partial_sitemap_callback is for the main UI in sitemap mode, not used here.
+            extracted_sitemap_links = await process_sitemaps(sitemap_urls_to_process, checker.session, show_partial_sitemap_callback=None)
             for link in extracted_sitemap_links:
                 norm_link = normalize_url(link)
                 if norm_link and norm_link not in queued and norm_link not in visited:
@@ -588,7 +597,7 @@ async def dynamic_frontier_crawl(
                     if urlparse(norm_link).netloc.lower() == base_netloc and regex_filter(norm_link, inc_re, exc_re):
                         frontier.append((0, norm_link)) # Add sitemap URLs at depth 0
                         queued.add(norm_link)
-            logging.info(f"Added {len(extracted_sitemap_links)} URLs from sitemaps to frontier.")
+            logging.info(f"Added {len(extracted_sitemap_links)} URLs from sitemaps to frontier for dynamic crawl.")
 
 
     processed_url_count = 0
@@ -607,7 +616,10 @@ async def dynamic_frontier_crawl(
 
             visited.add(current_url)
             processed_url_count +=1
-            logging.info(f"Crawling URL ({processed_url_count}/{len(queued)} in queue, {len(visited)} visited): {current_url} at depth {depth}")
+            # logging.info(f"Crawling URL ({processed_url_count}/{len(queued)} in queue, {len(visited)} visited): {current_url} at depth {depth}")
+            # More concise logging for progress
+            logging.info(f"Spider: {processed_url_count}/{max_urls_to_crawl} - Visiting: {current_url}")
+
 
             try:
                 result = await checker.fetch_and_parse(current_url, dynamic_speed_mode=dynamic_speed_mode)
@@ -615,7 +627,7 @@ async def dynamic_frontier_crawl(
                     results.append(result)
                 else: # Should not happen
                     logging.warning(f"No result returned for URL: {current_url}, adding to failed.")
-                    checker.failed_urls.add(current_url)
+                    checker.failed_urls.add(current_url) # Mark as failed
 
 
                 # Discover new links only if page was HTML and successfully fetched (status 200)
@@ -623,17 +635,26 @@ async def dynamic_frontier_crawl(
                 if result and result.get("Final_Status_Code") == "200" and \
                    result.get("Content_Type", "").startswith("text/html") and \
                    result.get("Blocked by Robots.txt") == "No":
-                    # Use the content from the result if available, otherwise re-fetch (less ideal)
-                    # For now, re-fetching for links to keep fetch_and_parse focused.
-                    # Consider passing content if fetch_and_parse could return it.
-                    page_content_for_links = "" # This would require fetch_and_parse to return content
-                                          # or a re-fetch. Let's assume discover_links handles fetching.
 
-                    discovered_links = await discover_links_from_html(current_url, result.get("Final_URL", current_url), checker.session, checker.user_agent, page_content_for_links)
+                    # Pass the actual HTML content if fetch_and_parse could return it.
+                    # For now, discover_links_from_html will re-fetch if content not provided.
+                    # This is a potential optimization point.
+                    page_html_content_for_links = None # Placeholder
+
+                    discovered_links = await discover_links_from_html(
+                        page_url=current_url, # Original URL before redirects for context
+                        final_page_url=result.get("Final_URL", current_url), # URL after redirects for base
+                        session=checker.session,
+                        user_agent=checker.user_agent,
+                        html_content=page_html_content_for_links
+                        )
                     logging.debug(f"Discovered {len(discovered_links)} links from {current_url}")
 
                     for link in discovered_links:
-                        if checker.is_stopped() or len(visited) + len(frontier) >= max_urls_to_crawl * 1.2 : # Heuristic to stop adding if queue grows too large vs max
+                        # Stop adding new links if we are already at/over the max_urls_to_crawl for *visited*
+                        # or if the frontier itself grows excessively large.
+                        if checker.is_stopped() or len(visited) >= max_urls_to_crawl \
+                           or len(queued) >= max_urls_to_crawl * 2: # Heuristic: stop adding if queue is 2x max crawl
                             break
 
                         norm_link = normalize_url(link)
@@ -642,28 +663,29 @@ async def dynamic_frontier_crawl(
 
                         # Filter links: must be on the same domain, and pass regex filters
                         if urlparse(norm_link).netloc.lower() == base_netloc and regex_filter(norm_link, inc_re, exc_re):
-                            if len(queued) < max_urls_to_crawl * 1.5: # Another heuristic to prevent excessive queue growth
+                            if len(queued) < max_urls_to_crawl * 2.5: # Another heuristic
                                 frontier.append((depth + 1, norm_link))
                                 queued.add(norm_link)
-                            else:
-                                logging.debug(f"Queue limit reached, not adding more links from {current_url}")
-                                break # Stop processing links from this page if queue is too full
-
-
+                            # else:
+                                # logging.debug(f"Queue limit reached, not adding more links from {current_url}")
+                                # break # Stop processing links from this page if queue is too full
             except Exception as e:
                 logging.error(f"Error processing URL {current_url} in dynamic_frontier_crawl loop: {str(e)}")
-                checker.failed_urls.add(current_url) # Ensure it's marked for potential recrawl
+                if current_url not in checker.failed_urls: # Add if not already marked by fetch_and_parse
+                    checker.failed_urls.add(current_url)
                 continue # Continue to next URL in frontier
 
             if show_partial_callback:
-                # crawled_count is len(visited), total_to_crawl is min(len(queued), max_urls_to_crawl)
-                show_partial_callback(results, len(visited), min(len(queued), max_urls_to_crawl))
+                # total_to_show_in_progress is min of (current queue size, max_urls_to_crawl)
+                # This gives a sense of progress towards the defined max, or total discovered if less than max.
+                total_for_progress = min(len(queued), max_urls_to_crawl) if max_urls_to_crawl > 0 else len(queued)
+                show_partial_callback(results, len(visited), total_for_progress)
 
         logging.info(f"Dynamic frontier crawl loop finished. Visited {len(visited)} URLs. Max URLs set to {max_urls_to_crawl}.")
         return results
 
     except Exception as e:
-        logging.error(f"Fatal error in dynamic_frontier_crawl: {str(e)}")
+        logging.error(f"Fatal error in dynamic_frontier_crawl: {str(e)}", exc_info=True)
         return results
     # finally:
         # checker.close() is handled by the calling function run_dynamic_crawl
@@ -679,31 +701,43 @@ async def discover_links_from_html(page_url: str, final_page_url:str, session: a
     headers = {"User-Agent": user_agent}
 
     try:
-        if not html_content: # If no content passed, fetch it
-            async with session.get(page_url, headers=headers, ssl=False, allow_redirects=True, timeout=10) as resp:
+        # If HTML content is not provided, fetch the page
+        # This part is crucial: if html_content is None, we need to fetch it.
+        if html_content is None:
+            logging.debug(f"No HTML content provided for {page_url}, fetching for link discovery.")
+            # Use a short timeout for link discovery fetching
+            link_discovery_timeout = aiohttp.ClientTimeout(total=10)
+            async with session.get(page_url, headers=headers, ssl=False, allow_redirects=True, timeout=link_discovery_timeout) as resp:
+                # Update final_page_url if redirects occurred during this specific fetch
+                actual_final_page_url = str(resp.url)
                 if resp.status == 200 and resp.content_type and resp.content_type.startswith("text/html"):
                     html_content = await resp.text(errors='replace')
+                    final_page_url = actual_final_page_url # Use the URL from which content was actually fetched
                 else:
-                    logging.warning(f"Could not fetch HTML for link discovery from {page_url} (status: {resp.status})")
+                    logging.warning(f"Could not fetch HTML for link discovery from {page_url} (status: {resp.status}, final URL: {actual_final_page_url})")
                     return [] # Return empty list if page can't be fetched/is not HTML
 
-        if html_content:
+        if html_content: # Proceed if HTML content is available (either passed in or fetched)
             soup = BeautifulSoup(html_content, "lxml")
             for anchor_tag in soup.find_all("a", href=True):
                 href = anchor_tag["href"].strip()
-                if href and not href.startswith(("mailto:", "tel:", "javascript:")):
+                if href and not href.startswith(("mailto:", "tel:", "javascript:", "#")): # Also ignore fragment-only links
                     try:
-                        # Use final_page_url as the base for resolving relative URLs
+                        # Use final_page_url (which might have been updated if fetched above) as the base
                         abs_link = urljoin(final_page_url, href)
                         parsed_abs_link = urlparse(abs_link)
                         # Ensure it's HTTP/HTTPS and has a netloc
                         if parsed_abs_link.scheme in ["http", "https"] and parsed_abs_link.netloc:
                             links.add(normalize_url(abs_link)) # Normalize before adding
-                    except Exception as e:
-                        logging.debug(f"Error processing link '{href}' from {page_url}: {e}")
+                    except Exception as e_join: # Catch errors during urljoin or parsing
+                        logging.debug(f"Error processing link '{href}' from page {page_url} (final base: {final_page_url}): {e_join}")
                         continue # Skip malformed links
-    except Exception as e:
-        logging.error(f"Error discovering links from {page_url}: {e}")
+    except aiohttp.ClientError as e_aio_links: # Catch client errors during the fetch for links
+        logging.warning(f"aiohttp ClientError during link discovery for {page_url}: {e_aio_links}")
+    except asyncio.TimeoutError:
+        logging.warning(f"Timeout during link discovery fetch for {page_url}")
+    except Exception as e_discover: # Catch any other unexpected errors
+        logging.error(f"General error discovering links from {page_url}: {e_discover}")
 
     return list(links)
 
@@ -750,8 +784,8 @@ async def run_dynamic_crawl(
         if checker.failed_urls:
             logging.info(f"Recrawling {len(checker.failed_urls)} failed URLs from dynamic crawl...")
             recrawl_results = await checker.recrawl_failed_urls(dynamic_speed_mode) # Pass speed mode
-            results.extend(recrawl_results)
-            logging.info(f"Recrawl completed. Added {len(recrawl_results)} more results. Total results: {len(results)}")
+            if recrawl_results: results.extend(recrawl_results) # Only extend if not None or empty
+            logging.info(f"Recrawl completed. Added {len(recrawl_results) if recrawl_results else 0} more results. Total results: {len(results)}")
         await checker.close() # Ensure session is closed
     return results
 
@@ -763,9 +797,15 @@ async def run_list_or_sitemap_crawl(urls: List[str], checker: URLChecker, show_p
         logging.info(f"Starting {crawl_mode_name} crawl for {len(urls)} URLs.")
         await checker.setup()
         # Normalize URLs before processing
-        normalized_urls = [normalize_url(u) for u in urls if normalize_url(u)]
-        unique_urls = sorted(list(set(normalized_urls))) # Process unique URLs
+        normalized_urls = [normalize_url(u) for u in urls if normalize_url(u)] # Filter out empty strings from normalization
+        unique_urls = sorted(list(set(filter(None, normalized_urls)))) # Process unique, non-empty URLs
+
         logging.info(f"Processing {len(unique_urls)} unique URLs for {crawl_mode_name} crawl.")
+        if not unique_urls:
+            logging.warning(f"No valid unique URLs to process for {crawl_mode_name} crawl.")
+            await checker.close() # Still need to close the checker
+            return []
+
 
         results = await chunk_process(unique_urls, checker, show_partial_callback=show_partial_callback, dynamic_speed_mode=dynamic_speed_mode)
         logging.info(f"{crawl_mode_name} crawl phase completed. Found {len(results)} primary results.")
@@ -773,12 +813,17 @@ async def run_list_or_sitemap_crawl(urls: List[str], checker: URLChecker, show_p
     except Exception as e:
         logging.error(f"Error during {crawl_mode_name} crawl execution: {e}", exc_info=True)
     finally:
-        if checker.failed_urls:
+        if checker.failed_urls: # checker might not be initialized if setup fails
             logging.info(f"Recrawling {len(checker.failed_urls)} failed URLs from {crawl_mode_name} crawl...")
             recrawl_results = await checker.recrawl_failed_urls(dynamic_speed_mode)
-            results.extend(recrawl_results)
-            logging.info(f"Recrawl completed. Added {len(recrawl_results)} results. Total: {len(results)}")
-        await checker.close()
+            if recrawl_results: results.extend(recrawl_results)
+            logging.info(f"Recrawl completed. Added {len(recrawl_results) if recrawl_results else 0} results. Total: {len(results)}")
+        # Ensure checker is closed if it was set up
+        if checker and checker.session is not None and not checker.session.closed:
+             await checker.close()
+        elif checker and checker.session is None: # If setup failed before session creation
+            logging.info("Checker session was not initialized, no close needed for session.")
+
     return results
 
 
@@ -788,19 +833,28 @@ async def fetch_sitemaps_from_robots(domain_base_url: str, session: aiohttp.Clie
     sitemap_urls: List[str] = []
     try:
         logging.info(f"Fetching robots.txt from {robots_url} to find sitemaps.")
-        async with session.get(robots_url, ssl=False, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        # Use a specific timeout for robots.txt fetching
+        robots_timeout = aiohttp.ClientTimeout(total=10)
+        async with session.get(robots_url, ssl=False, timeout=robots_timeout, allow_redirects=True) as resp: # Allow redirects for robots.txt too
             if resp.status == 200:
                 content = await resp.text(errors='replace')
                 for line in content.splitlines():
-                    if line.strip().lower().startswith("sitemap:"):
+                    line_lower = line.strip().lower()
+                    if line_lower.startswith("sitemap:"):
                         sitemap_url = line.split(":", 1)[1].strip()
-                        sitemap_urls.append(sitemap_url)
+                        # Basic validation that it looks like a URL
+                        if normalize_url(sitemap_url): # Check if it's a parseable URL
+                            sitemap_urls.append(sitemap_url)
                 if sitemap_urls:
-                    logging.info(f"Found sitemap URLs in robots.txt: {sitemap_urls}")
+                    logging.info(f"Found sitemap URLs in robots.txt ({robots_url}): {sitemap_urls}")
                 else:
                     logging.info(f"No sitemap directives found in robots.txt for {domain_base_url}")
             else:
                 logging.warning(f"Could not fetch robots.txt from {robots_url} (status: {resp.status})")
+    except asyncio.TimeoutError:
+        logging.warning(f"Timeout fetching robots.txt from {robots_url}")
+    except aiohttp.ClientError as e_robots:
+        logging.warning(f"ClientError fetching robots.txt from {robots_url}: {e_robots}")
     except Exception as e:
         logging.error(f"Error fetching or parsing robots.txt at {robots_url}: {e}")
     return sitemap_urls
@@ -810,76 +864,79 @@ async def process_sitemaps(sitemap_urls: List[str], session: aiohttp.ClientSessi
     """
     Process multiple sitemap URLs concurrently and extract all unique URLs.
     Handles nested sitemap indexes.
+    Uses a queue and worker pattern for processing sitemap files themselves.
     """
     all_found_urls: Set[str] = set()
+    # Queue stores sitemap URLs to be fetched and parsed
     sitemaps_to_process_queue: asyncio.Queue[str] = asyncio.Queue()
-    processed_sitemap_files: Set[str] = set() # To avoid re-processing same sitemap file if linked multiple times
+    # Set to keep track of sitemap *file* URLs that have been added to the queue or processed, to avoid cycles/redundancy
+    processed_sitemap_files: Set[str] = set()
 
+    # Initial population of the queue
     for s_url in sitemap_urls:
         normalized_s_url = normalize_url(s_url)
-        if normalized_s_url:
+        if normalized_s_url and normalized_s_url not in processed_sitemap_files:
             await sitemaps_to_process_queue.put(normalized_s_url)
-            processed_sitemap_files.add(normalized_s_url) # Add initial ones to avoid re-queueing if they are also indexes
+            processed_sitemap_files.add(normalized_s_url)
 
-    active_tasks = 0
+    # Worker function to process one sitemap file from the queue
+    async def sitemap_file_worker():
+        while True:
+            try:
+                # Get a sitemap URL from the queue to process
+                # Use a timeout to prevent indefinite blocking if queue logic has issues
+                current_sitemap_url = await asyncio.wait_for(sitemaps_to_process_queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                # If queue is empty and no tasks are adding, this worker can exit.
+                # This relies on other parts of the logic to ensure queue.join() will eventually unblock.
+                if sitemaps_to_process_queue.empty(): # Double check
+                    break
+                continue # Or just continue to try getting again
 
-    async def process_single_sitemap_worker(s_url: str):
-        nonlocal active_tasks
-        active_tasks += 1
-        try:
-            logging.info(f"Processing sitemap: {s_url}")
-            urls_from_sitemap, nested_sitemaps = await async_parse_sitemap_xml_or_text(s_url, session)
+            try:
+                logging.info(f"Worker processing sitemap file: {current_sitemap_url}")
+                # Parse the current sitemap file (this might be an index or a regular sitemap)
+                urls_from_this_sitemap, nested_sitemaps_from_this_index = await async_parse_sitemap_xml_or_text(current_sitemap_url, session)
 
-            for u_url in urls_from_sitemap:
-                norm_u = normalize_url(u_url)
-                if norm_u:
-                    all_found_urls.add(norm_u)
+                # Add extracted page URLs to the main set
+                for u_url in urls_from_this_sitemap:
+                    norm_u = normalize_url(u_url)
+                    if norm_u: # Ensure it's a valid, normalized URL
+                        all_found_urls.add(norm_u)
 
-            for ns_url in nested_sitemaps:
-                norm_ns = normalize_url(ns_url)
-                if norm_ns and norm_ns not in processed_sitemap_files:
-                    await sitemaps_to_process_queue.put(norm_ns)
-                    processed_sitemap_files.add(norm_ns) # Mark as added to queue
+                # Add any discovered nested sitemap URLs to the queue if not already processed/queued
+                for ns_url in nested_sitemaps_from_this_index:
+                    norm_ns = normalize_url(ns_url)
+                    if norm_ns and norm_ns not in processed_sitemap_files:
+                        await sitemaps_to_process_queue.put(norm_ns)
+                        processed_sitemap_files.add(norm_ns) # Mark as added to queue
 
-            if show_partial_sitemap_callback:
-                show_partial_sitemap_callback(list(all_found_urls)) # Update UI with current count
+                # Update UI if callback provided (shows cumulative count)
+                if show_partial_sitemap_callback:
+                    show_partial_sitemap_callback(list(all_found_urls))
 
-        except Exception as e:
-            logging.error(f"Error processing sitemap {s_url} in worker: {e}")
-        finally:
-            sitemaps_to_process_queue.task_done()
-            active_tasks -=1
+            except Exception as e_worker:
+                logging.error(f"Error in sitemap_file_worker for {current_sitemap_url}: {e_worker}")
+            finally:
+                sitemaps_to_process_queue.task_done() # Signal that this item from queue is processed
 
-    # Create worker tasks
-    # Limit concurrent sitemap processing tasks, e.g., to 5
-    # This is for fetching/parsing sitemap files themselves, not the URLs within them.
-    MAX_SITEMAP_WORKERS = 5
-    workers = []
+    # Create and start a limited number of worker tasks
+    # This limits concurrent *fetching and parsing of sitemap files themselves*
+    MAX_SITEMAP_FILE_WORKERS = 5 # e.g., 5 concurrent sitemap file processors
+    worker_tasks = [asyncio.create_task(sitemap_file_worker()) for _ in range(MAX_SITEMAP_FILE_WORKERS)]
 
-    while True:
-        try:
-            # Wait for a short duration if queue is empty but tasks might still be adding to it
-            sitemap_url_to_work_on = await asyncio.wait_for(sitemaps_to_process_queue.get(), timeout=1.0)
-        except asyncio.TimeoutError:
-            if active_tasks == 0 and sitemaps_to_process_queue.empty():
-                break # All sitemaps processed and queue is empty
-            continue # Continue waiting if tasks are still active
+    # Wait for the queue to be fully processed
+    await sitemaps_to_process_queue.join()
 
-        if len(workers) >= MAX_SITEMAP_WORKERS:
-            # Wait for one of the existing workers to complete
-            _done, workers = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
+    # All items in queue have been processed, now cancel the worker tasks
+    for task in worker_tasks:
+        task.cancel()
+    # Wait for worker tasks to finish after cancellation
+    await asyncio.gather(*worker_tasks, return_exceptions=True)
 
-        task = asyncio.create_task(process_single_sitemap_worker(sitemap_url_to_work_on))
-        workers.append(task)
 
-    # Wait for all remaining tasks to complete
-    if workers:
-        await asyncio.wait(workers)
-
-    await sitemaps_to_process_queue.join() # Ensure queue is fully processed
-
-    logging.info(f"Finished processing all sitemaps. Found {len(all_found_urls)} unique URLs.")
-    return sorted(list(all_found_urls))
+    logging.info(f"Finished processing all sitemap files. Discovered {len(all_found_urls)} unique page URLs.")
+    return sorted(list(all_found_urls)) # Return sorted list of unique page URLs
 
 
 async def async_parse_sitemap_xml_or_text(url: str, session: aiohttp.ClientSession) -> Tuple[List[str], List[str]]:
@@ -891,60 +948,65 @@ async def async_parse_sitemap_xml_or_text(url: str, session: aiohttp.ClientSessi
     nested_sitemap_urls: List[str] = []
     try:
         # Use a timeout for fetching individual sitemap files
-        timeout = aiohttp.ClientTimeout(total=20) # 20 seconds for fetching a sitemap file
-        async with session.get(url, ssl=False, timeout=timeout) as response:
+        sitemap_file_timeout = aiohttp.ClientTimeout(total=30) # Increased timeout for potentially large sitemap files
+        async with session.get(url, ssl=False, timeout=sitemap_file_timeout, allow_redirects=True) as response: # Allow redirects for sitemap URLs
+            actual_url_fetched = str(response.url) # URL after redirects
+            if url != actual_url_fetched:
+                logging.info(f"Sitemap URL {url} redirected to {actual_url_fetched}")
+
             if response.status == 200:
-                content = await response.text(errors='replace')
+                content = await response.text(errors='replace') # Read content
                 content_type = response.headers.get("Content-Type", "").lower()
 
+                # Try XML parsing if content type suggests XML or if it starts with XML declaration
                 if 'xml' in content_type or content.strip().startswith('<?xml'):
-                    # Parse XML content
                     try:
                         root = ET.fromstring(content)
-                        # Define namespaces commonly found in sitemaps
-                        namespaces = {
-                            'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9',
-                            # Add other namespaces if needed, e.g., for image or video sitemaps
-                        }
+                        # Common sitemap namespace
+                        # Using '*' for namespace prefix in findall to be more robust if ns changes or is default
+                        # For specific namespace: namespaces = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+                        # And then e.g. root.findall('.//sm:sitemap', namespaces=namespaces)
 
-                        # Check if this is a sitemap index
-                        if root.tag.endswith('sitemapindex'):
-                            for sitemap_element in root.findall('.//sm:sitemap', namespaces=namespaces):
-                                loc_element = sitemap_element.find('sm:loc', namespaces=namespaces)
-                                if loc_element is not None and loc_element.text:
-                                    nested_sitemap_urls.append(loc_element.text.strip())
-                        else: # Regular sitemap
-                            for url_element in root.findall('.//sm:url', namespaces=namespaces):
-                                loc_element = url_element.find('sm:loc', namespaces=namespaces)
-                                if loc_element is not None and loc_element.text:
-                                    page_urls.append(loc_element.text.strip())
+                        # Check if this is a sitemap index file
+                        if root.tag.endswith('sitemapindex'): # Works for {namespace}sitemapindex or just sitemapindex
+                            for sitemap_element in root.findall('.//{*}sitemap/{*}loc'): # Find loc inside sitemap
+                                if sitemap_element is not None and sitemap_element.text:
+                                    nested_sitemap_urls.append(sitemap_element.text.strip())
+                        else: # Regular sitemap with <url> entries
+                            for url_element in root.findall('.//{*}url/{*}loc'): # Find loc inside url
+                                if url_element is not None and url_element.text:
+                                    page_urls.append(url_element.text.strip())
+                        if page_urls or nested_sitemap_urls:
+                             logging.debug(f"Parsed XML sitemap {actual_url_fetched}: Found {len(page_urls)} pages, {len(nested_sitemap_urls)} nested sitemaps.")
+
                     except ET.ParseError as e_xml:
-                        logging.warning(f"XML ParseError for sitemap {url}: {e_xml}. Trying text parse.")
-                        # Fallback to text parsing if XML parsing fails for some reason (e.g. malformed XML but still text)
+                        logging.warning(f"XML ParseError for sitemap {actual_url_fetched}: {e_xml}. Attempting text parse as fallback.")
+                        # Fallback: if XML parsing fails, try to parse as a simple text sitemap (one URL per line)
                         for line in content.splitlines():
                             line = line.strip()
-                            if line and (line.startswith("http://") or line.startswith("https://")):
+                            if normalize_url(line): # Check if the line is a valid URL
                                 page_urls.append(line)
-
-                elif 'text/plain' in content_type or not content_type : # Treat as text sitemap if XML not detected or no content type
-                    logging.info(f"Parsing {url} as a text sitemap.")
+                # If not XML, or if XML parsing failed and we fall through, try plain text
+                # (Only if it wasn't already parsed as text in the XML fallback)
+                elif 'text/plain' in content_type or not content_type or not (page_urls or nested_sitemap_urls):
+                    logging.debug(f"Parsing {actual_url_fetched} as a text sitemap (Content-Type: {content_type}).")
                     for line in content.splitlines():
                         line = line.strip()
-                        # Basic validation for a URL
-                        if line and (line.startswith("http://") or line.startswith("https://")) and '.' in urlparse(line).netloc :
+                        if normalize_url(line): # Basic validation for a URL
                             page_urls.append(line)
                 else:
-                    logging.warning(f"Unsupported Content-Type '{content_type}' for sitemap {url}. Skipping.")
-
+                    logging.warning(f"Unsupported or unparsed Content-Type '{content_type}' for sitemap {actual_url_fetched}. No URLs extracted by this parser.")
             else:
-                logging.error(f"Failed to fetch sitemap {url}. Status: {response.status}")
+                logging.error(f"Failed to fetch sitemap {actual_url_fetched}. Status: {response.status}")
     except asyncio.TimeoutError:
-        logging.error(f"Timeout fetching sitemap {url}.")
-    except aiohttp.ClientError as e_aio: # Catch more specific aiohttp client errors
-        logging.error(f"ClientError fetching sitemap {url}: {e_aio}")
-    except Exception as e:
-        logging.error(f"Unexpected error parsing sitemap {url}: {e}")
-    return page_urls, nested_sitemap_urls
+        logging.error(f"Timeout fetching sitemap file {url}.")
+    except aiohttp.ClientError as e_aio_sitemap:
+        logging.error(f"aiohttp ClientError fetching sitemap file {url}: {e_aio_sitemap}")
+    except Exception as e_parse:
+        logging.error(f"Unexpected error parsing sitemap file {url}: {e_parse}", exc_info=True)
+
+    # Remove duplicates that might have occurred if both XML and text parsing added same URLs
+    return list(set(page_urls)), list(set(nested_sitemap_urls))
 
 
 async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callback=None, dynamic_speed_mode: bool = False) -> List[Dict]:
@@ -967,24 +1029,29 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
     for future in asyncio.as_completed(tasks):
         if checker.is_stopped(): # Check if stop requested during processing
             logging.info("Chunk processing interrupted by stop request.")
-            # Optionally, cancel remaining tasks if desired, but as_completed will naturally stop yielding them
-            # for task_to_cancel in tasks:
-            #    if not task_to_cancel.done():
-            #        task_to_cancel.cancel()
-            break
+            # Cancel remaining UNSTARTED tasks (those not yet awaited by as_completed)
+            # Note: Tasks already running will continue until their next await point or completion.
+            for task_to_cancel in tasks:
+               if not task_to_cancel.done(): # Check if not already done
+                   task_to_cancel.cancel()
+            break # Exit the loop
 
         try:
-            result = await future # Get result from completed task
-            if result: # fetch_and_parse should always return a dict
+            result = await future # Get result from completed task (or cancelled error)
+            if result: # fetch_and_parse should always return a dict, even for "Skipped"
                 results.append(result)
+        except asyncio.CancelledError:
+            logging.info("A task in chunk_process was cancelled.")
         except Exception as e:
             # This catch block might be redundant if fetch_and_parse handles its own errors
             # and returns a dict with error info. However, it can catch unexpected errors from await future.
-            logging.error(f"Error processing a URL in chunk: {e}")
+            logging.error(f"Error processing a URL in chunk (await future): {e}")
             # We might not know which URL failed here if not careful, fetch_and_parse should include Original_URL
         finally:
             processed_count += 1
-            if show_partial_callback:
+            if show_partial_callback: # Ensure callback is only called if defined
+                # Filter out "Skipped" results from the count for progress display if desired,
+                # or count them as processed. Here, we count all attempts.
                 show_partial_callback(results, processed_count, total_urls)
 
     # checker.close() is also handled by the calling function
@@ -994,22 +1061,28 @@ async def chunk_process(urls: List[str], checker: URLChecker, show_partial_callb
 def normalize_url(url: str) -> str:
     """
     Normalize a URL: adds scheme if missing, removes fragment, lowercases scheme and netloc.
+    Returns empty string if URL is fundamentally invalid or empty.
     """
-    if not url: return ""
+    if not url or not isinstance(url, str): return ""
     url = url.strip()
-    parsed = urlparse(url)
+    if not url: return ""
 
-    scheme = parsed.scheme.lower()
-    if not scheme: scheme = 'https' # Default to https
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        if not scheme: scheme = 'https' # Default to https
 
-    netloc = parsed.netloc.lower()
-    path = parsed.path
-    if not path: path = '/' # Ensure path is at least '/'
+        netloc = parsed.netloc.lower()
+        if not netloc: return "" # A URL without a domain/netloc is usually invalid for crawling
 
-    # Reconstruct, excluding fragment and query params if desired (currently keeping query)
-    # To remove query params: parsed = parsed._replace(query="")
-    normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, "")) # Fragment removed
-    return normalized
+        path = parsed.path
+        if not path: path = '/' # Ensure path is at least '/'
+
+        # Reconstruct, excluding fragment. Keep query parameters.
+        normalized = urlunparse((scheme, netloc, path, parsed.params, parsed.query, "")) # Fragment ('') removed
+        return normalized
+    except Exception: # Catch any parsing errors for malformed URLs
+        return ""
 
 
 def update_redirect_label(data: Dict, original_url: str) -> Dict:
@@ -1036,33 +1109,23 @@ def update_redirect_label(data: Dict, original_url: str) -> Dict:
         return data
 
 
-    if norm_final_url == norm_original_url:
+    if norm_final_url == norm_original_url: # No change in URL after normalization
         if 200 <= final_status_code < 300:
             data["Final_Status_Type"] = "OK (No Redirect)"
-        else: # e.g. 404 on the original URL itself
-            data["Final_Status_Type"] = f"{data.get('Final_Status_Type', '')} (No Redirect)"
-    else: # It's a redirect
+        # If status is not 2xx but URL is same, it's an error on the original URL
+        # The initial status_label would have set Client Error/Server Error. Add (No Redirect).
+        else:
+            current_type = data.get('Final_Status_Type', self.status_label(final_status_code) if hasattr(self, 'status_label') else 'Unknown Status')
+            data["Final_Status_Type"] = f"{current_type} (No Redirect)"
+    else: # It's a redirect (final URL differs from original)
         if 200 <= final_status_code < 300:
             data["Final_Status_Type"] = "Redirect to 2xx"
-        elif 300 <= final_status_code < 400:
-            # This case implies a redirect chain that ended in another redirect,
-            # which aiohttp usually resolves. If final status is 3xx, it's likely
-            # the max_redirects was hit or allow_redirects=False for that specific request.
-            # However, our main fetch_and_parse uses allow_redirects=True by default for the session.
-            # This might indicate a redirect loop or a misconfiguration.
-            data["Final_Status_Type"] = f"Redirect to {final_status_code}"
-        elif 400 <= final_status_code < 600:
+        elif 300 <= final_status_code < 400: # Final status is a redirect code
+            data["Final_Status_Type"] = f"Redirect Chain to {final_status_code}" # Indicates it ended on a redirect
+        elif 400 <= final_status_code < 600: # Final status is an error code
             data["Final_Status_Type"] = f"Redirect to Error {final_status_code}"
-        else:
-            data["Final_Status_Type"] = f"Redirect to Unknown Status ({final_status_code})"
-
-    # Check for canonical mismatch after determining redirect status
-    # This is an indexability concern, not strictly a redirect type.
-    # update_indexability_from_directives already handles canonical impact on indexability.
-    # We can add a note here if desired, but it might be redundant.
-    # canonical_url = data.get("Canonical_URL", "")
-    # if canonical_url and normalize_url(canonical_url) != norm_final_url:
-    #    data["Final_Status_Type"] += " (Canonical Mismatch)" # Appending to existing type
+        else: # Other statuses
+            data["Final_Status_Type"] = f"Redirect to Status {final_status_code}"
 
     return data
 
@@ -1098,9 +1161,42 @@ def format_and_reorder_df(df: pd.DataFrame) -> pd.DataFrame:
             remaining_cols.remove(col)
 
     # Add any other columns that were not in the desired_cols_order list (e.g., new fields)
-    ordered_cols.extend(remaining_cols)
+    ordered_cols.extend(sorted(remaining_cols)) # Sort remaining columns alphabetically
 
     return df[ordered_cols]
+
+# New async helper function for sitemap processing
+async def fetch_and_process_sitemap_urls(sitemap_xml_urls: List[str], user_agent_str: str, progress_callback) -> List[str]:
+    """
+    Asynchronously fetches and processes sitemap URLs using a dedicated aiohttp session.
+    Args:
+        sitemap_xml_urls: List of sitemap XML URLs to process.
+        user_agent_str: User agent string to use for requests.
+        progress_callback: Streamlit callback to show discovered sitemap URLs.
+    Returns:
+        A list of all unique page URLs found in the sitemaps.
+    Raises:
+        Exception: If there's an error during session creation or sitemap processing.
+    """
+    all_urls = []
+    # This function is async, so it's fine to use async with here
+    # Use a more specific timeout for operations within this function if needed
+    connector_timeout = aiohttp.ClientTimeout(total=60) # Timeout for the entire sitemap processing session part
+    temp_connector = aiohttp.TCPConnector(ssl=False) # Recreate connector inside async function if used across awaits without session persistence
+    try:
+        async with aiohttp.ClientSession(connector=temp_connector, headers={"User-Agent": user_agent_str}, timeout=connector_timeout) as sitemap_session:
+            all_urls = await process_sitemaps(
+                sitemap_xml_urls,
+                session=sitemap_session, # Pass the created session
+                show_partial_sitemap_callback=progress_callback
+            )
+        # Final update via callback if provided (process_sitemaps might also call it intermittently)
+        if progress_callback and all_urls: # Check if all_urls has content
+            progress_callback(all_urls)
+    except Exception as e:
+        logging.error(f"Exception in fetch_and_process_sitemap_urls: {e}", exc_info=True)
+        raise # Re-raise the exception to be caught by the caller in main thread
+    return all_urls
 
 
 def main():
@@ -1147,7 +1243,13 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("🎯 Crawl Mode & Input")
     mode = st.sidebar.radio("Select Mode", ["Spider", "List", "Sitemap"], index=0, key="crawl_mode_radio", horizontal=False)
-    st.session_state['current_crawl_mode'] = mode # Update current mode
+    # Update current mode in session state if it changes (helps with button states)
+    if st.session_state.current_crawl_mode != mode:
+        st.session_state.current_crawl_mode = mode
+        st.session_state.is_crawling = False # Reset crawling state if mode changes
+        st.session_state.crawl_done = False
+        st.session_state.crawl_results = []
+
 
     # --- UI Placeholders ---
     # These will be defined within each mode's section if needed, or globally if shared
@@ -1158,6 +1260,10 @@ def main():
 
     # --- Callback for partial data updates ---
     def show_partial_data_streamlit(current_results: List[Dict], processed_count: int, total_count: int):
+        # Ensure we are in the correct crawl operation before updating UI
+        # This check might be overly cautious if UI elements are cleared properly on mode switch.
+        # if not st.session_state.get('is_crawling'): return
+
         if total_count > 0:
             ratio = min(1.0, processed_count / total_count if total_count > 0 else 0)
             progress_bar_placeholder.progress(ratio)
@@ -1172,20 +1278,28 @@ def main():
             )
 
         if current_results: # Only update table if there are results
-            df_temp = pd.DataFrame(current_results)
-            df_temp_formatted = format_and_reorder_df(df_temp)
-            # Display a limited number of rows during crawl for performance
-            results_table_placeholder.dataframe(df_temp_formatted.head(1000), height=400, use_container_width=True)
+            try:
+                df_temp = pd.DataFrame(current_results) # Ensure current_results is suitable for DataFrame
+                df_temp_formatted = format_and_reorder_df(df_temp)
+                # Display a limited number of rows during crawl for performance
+                results_table_placeholder.dataframe(df_temp_formatted.head(1000), height=400, use_container_width=True)
+            except Exception as e_df:
+                logging.error(f"Error creating/displaying partial DataFrame: {e_df}")
+                # results_table_placeholder.warning("Error updating results table.")
 
 
     # --- Sitemap URLs display callback (for sitemap mode input) ---
-    sitemap_urls_display_placeholder = st.empty()
+    sitemap_urls_display_placeholder = st.empty() # Specific placeholder for sitemap discovery
     def show_discovered_sitemap_urls_streamlit(discovered_urls: List[str]):
         if discovered_urls:
-            sitemap_urls_display_placeholder.info(f"Discovered {len(discovered_urls)} URLs from sitemaps. Ready to crawl.")
-            # st.expander("View Discovered URLs").dataframe(pd.DataFrame(discovered_urls, columns=["URLs from Sitemaps"]))
-        else:
-            sitemap_urls_display_placeholder.info("No URLs discovered from the provided sitemaps yet.")
+            sitemap_urls_display_placeholder.success(f"Successfully fetched and processed sitemaps. Discovered {len(discovered_urls)} unique URLs. Ready to crawl.")
+            # Optionally, show a sample in an expander:
+            # with st.expander("View Sample of Discovered URLs from Sitemaps (up to 100)"):
+            #    st.dataframe(pd.DataFrame(discovered_urls[:100], columns=["Discovered URLs"]))
+        elif st.session_state.get('is_crawling') and st.session_state.get('crawl_op_id') == "sitemap_fetch": # If fetching sitemaps specifically
+             sitemap_urls_display_placeholder.info("Processing sitemaps... No page URLs discovered yet.")
+        # else:
+            # sitemap_urls_display_placeholder.info("No URLs discovered from the provided sitemaps yet.")
 
 
     # === Spider Mode UI ===
@@ -1203,31 +1317,43 @@ def main():
         exclude_pattern_spider = col_exc.text_input("Exclude URLs matching Regex:", placeholder="e.g., /blog/category/old/", key="spider_exclude_regex")
 
         start_stop_col, _ = st.columns([1,3]) # Column for button
-        if st.session_state['is_crawling'] and st.session_state.get('crawl_op_id') == "spider":
+        # Use a unique operation ID for spider mode to manage its specific crawling state
+        spider_op_id = f"spider_crawl_{seed_url_input}_{max_urls_spider}"
+
+
+        if st.session_state.get('is_crawling') and st.session_state.get('current_op_id') == spider_op_id :
             if start_stop_col.button("🛑 Stop Crawl", key="spider_stop_btn"):
-                if st.session_state['checker_instance']:
+                if st.session_state.get('checker_instance'):
                     st.session_state['checker_instance'].stop()
-                st.session_state['is_crawling'] = False # Assume stop is immediate for UI
+                # st.session_state['is_crawling'] = False # Let the crawl loop update this on actual stop
                 st.warning("Stop request sent. Finishing current tasks...")
-        elif not st.session_state['is_crawling']:
+                # No immediate rerun, user needs to press start again.
+        elif not st.session_state.get('is_crawling'): # If no crawl is active
             if start_stop_col.button("🚀 Start Spider Crawl", key="spider_start_btn"):
-                if seed_url_input and normalize_url(seed_url_input):
+                norm_seed_url = normalize_url(seed_url_input)
+                if norm_seed_url:
+                    # Clear previous results and progress for a new crawl
+                    results_table_placeholder.empty()
+                    download_buttons_placeholder.empty()
+                    progress_text_placeholder.info("Spider crawl starting...")
+                    progress_bar_placeholder.progress(0.0)
+
+
                     st.session_state['is_crawling'] = True
                     st.session_state['crawl_done'] = False
                     st.session_state['crawl_results'] = []
-                    st.session_state['crawl_op_id'] = "spider" # Identifier for this operation
-                    results_table_placeholder.empty() # Clear previous table
-                    progress_text_placeholder.info("Spider crawl starting...")
-
+                    st.session_state['current_op_id'] = spider_op_id # Set current operation
 
                     checker = URLChecker(user_agent, concurrency, timeout_seconds, respect_robots)
-                    st.session_state['checker_instance'] = checker
+                    st.session_state['checker_instance'] = checker # Store checker instance
+
+                    # Run the async crawl function
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     try:
                         results = loop.run_until_complete(
                             run_dynamic_crawl(
-                                seed_url=normalize_url(seed_url_input), checker=checker,
+                                seed_url=norm_seed_url, checker=checker,
                                 include_pattern=include_pattern_spider, exclude_pattern=exclude_pattern_spider,
                                 crawl_sitemaps=spider_crawl_sitemaps, max_urls=max_urls_spider,
                                 show_partial_callback=show_partial_data_streamlit,
@@ -1235,16 +1361,21 @@ def main():
                             )
                         )
                         st.session_state['crawl_results'] = results
-                        st.session_state['crawl_done'] = True
-                        progress_text_placeholder.success(f"Spider crawl finished! Found {len(results)} results.")
+                        if not checker.is_stopped(): # If crawl wasn't manually stopped
+                             progress_text_placeholder.success(f"Spider crawl finished! Found {len(results)} results.")
+                        else:
+                             progress_text_placeholder.warning(f"Spider crawl stopped by user. Collected {len(results)} results.")
+
                     except Exception as e:
                         st.error(f"Spider crawl failed: {e}")
                         logging.error("Spider Crawl Exception", exc_info=True)
-                        st.session_state['crawl_done'] = True # Mark as done even if failed
+                        progress_text_placeholder.error(f"Spider crawl failed: {e}")
                     finally:
                         loop.close()
                         st.session_state['is_crawling'] = False
-                        st.session_state['checker_instance'] = None # Clear checker
+                        st.session_state['crawl_done'] = True # Mark as done to show final results/buttons
+                        st.session_state['checker_instance'] = None # Clear checker instance
+                        st.rerun() # Rerun to update button states and display final results
                 else:
                     st.warning("Please enter a valid seed URL.")
 
@@ -1253,22 +1384,26 @@ def main():
         st.subheader("📋 List Mode")
         url_list_input = st.text_area("Enter URLs (one per line):", height=200, placeholder="https://example.com/page1\nhttps://example.com/page2", key="list_urls_area")
         start_stop_col_list, _ = st.columns([1,3])
+        list_op_id = f"list_crawl_{hash(url_list_input)}" # Op ID based on input
 
-        if st.session_state['is_crawling'] and st.session_state.get('crawl_op_id') == "list":
+        if st.session_state.get('is_crawling') and st.session_state.get('current_op_id') == list_op_id:
             if start_stop_col_list.button("🛑 Stop Crawl", key="list_stop_btn"):
-                if st.session_state['checker_instance']: st.session_state['checker_instance'].stop()
-                st.session_state['is_crawling'] = False
+                if st.session_state.get('checker_instance'): st.session_state['checker_instance'].stop()
                 st.warning("Stop request sent for List crawl.")
-        elif not st.session_state['is_crawling']:
+        elif not st.session_state.get('is_crawling'):
             if start_stop_col_list.button("🚀 Start List Crawl", key="list_start_btn"):
                 user_urls = [u.strip() for u in url_list_input.splitlines() if u.strip()]
                 if user_urls:
+                    results_table_placeholder.empty()
+                    download_buttons_placeholder.empty()
+                    progress_text_placeholder.info("List crawl starting...")
+                    progress_bar_placeholder.progress(0.0)
+
                     st.session_state['is_crawling'] = True
                     st.session_state['crawl_done'] = False
                     st.session_state['crawl_results'] = []
-                    st.session_state['crawl_op_id'] = "list"
-                    results_table_placeholder.empty()
-                    progress_text_placeholder.info("List crawl starting...")
+                    st.session_state['current_op_id'] = list_op_id
+
 
                     checker = URLChecker(user_agent, concurrency, timeout_seconds, respect_robots)
                     st.session_state['checker_instance'] = checker
@@ -1284,16 +1419,20 @@ def main():
                             )
                         )
                         st.session_state['crawl_results'] = results
-                        st.session_state['crawl_done'] = True
-                        progress_text_placeholder.success(f"List crawl finished! Found {len(results)} results.")
+                        if not checker.is_stopped():
+                            progress_text_placeholder.success(f"List crawl finished! Found {len(results)} results.")
+                        else:
+                            progress_text_placeholder.warning(f"List crawl stopped. Collected {len(results)} results.")
                     except Exception as e:
                         st.error(f"List crawl failed: {e}")
                         logging.error("List Crawl Exception", exc_info=True)
-                        st.session_state['crawl_done'] = True
+                        progress_text_placeholder.error(f"List crawl failed: {e}")
                     finally:
                         loop.close()
                         st.session_state['is_crawling'] = False
+                        st.session_state['crawl_done'] = True
                         st.session_state['checker_instance'] = None
+                        st.rerun()
                 else:
                     st.warning("Please enter at least one URL.")
 
@@ -1301,55 +1440,71 @@ def main():
     elif mode == "Sitemap":
         st.subheader("🗺️ Sitemap Mode")
         sitemap_urls_input = st.text_area("Enter Sitemap XML URLs (one per line):", height=150, placeholder="https://example.com/sitemap.xml\nhttps://example.com/sitemap_index.xml", key="sitemap_urls_area")
-        start_stop_col_sitemap, _ = st.columns([1,3])
+        start_stop_col_sitemap, _ = st.columns([1,3]) # Button column
+        sitemap_op_id = f"sitemap_crawl_{hash(sitemap_urls_input)}"
 
-        if st.session_state['is_crawling'] and st.session_state.get('crawl_op_id') == "sitemap":
+
+        if st.session_state.get('is_crawling') and st.session_state.get('current_op_id') == sitemap_op_id:
             if start_stop_col_sitemap.button("🛑 Stop Crawl", key="sitemap_stop_btn"):
-                if st.session_state['checker_instance']: st.session_state['checker_instance'].stop()
-                st.session_state['is_crawling'] = False
+                if st.session_state.get('checker_instance'): st.session_state['checker_instance'].stop()
+                # Also need a way to stop sitemap fetching if it's in that phase
+                # This might require a shared stop event or more complex state management for multi-phase ops.
+                # For now, checker.stop() will affect the crawling phase.
                 st.warning("Stop request sent for Sitemap crawl.")
-        elif not st.session_state['is_crawling']:
+        elif not st.session_state.get('is_crawling'):
             if start_stop_col_sitemap.button("🔗 Fetch & Crawl Sitemaps", key="sitemap_start_btn"):
                 sitemap_xml_urls = [s.strip() for s in sitemap_urls_input.splitlines() if s.strip()]
                 if sitemap_xml_urls:
-                    st.session_state['is_crawling'] = True # Mark as crawling during sitemap parsing too
-                    st.session_state['crawl_done'] = False
-                    st.session_state['crawl_results'] = []
-                    st.session_state['crawl_op_id'] = "sitemap"
                     results_table_placeholder.empty()
+                    download_buttons_placeholder.empty()
                     progress_text_placeholder.info("Fetching URLs from sitemaps...")
+                    progress_bar_placeholder.progress(0.0) # Reset progress bar
                     sitemap_urls_display_placeholder.empty() # Clear previous discovery message
 
-                    # Temporary session for sitemap parsing
-                    temp_session_loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(temp_session_loop)
+                    st.session_state['is_crawling'] = True # Mark as active
+                    st.session_state['crawl_done'] = False
+                    st.session_state['crawl_results'] = []
+                    st.session_state['current_op_id'] = sitemap_op_id # For sitemap fetching + crawling
+
                     all_urls_from_sitemaps = []
+                    sitemap_fetch_failed = False
+                    # --- Phase 1: Fetch URLs from Sitemaps ---
+                    st.session_state['crawl_op_id'] = f"{sitemap_op_id}_fetch" # More specific op_id
+                    sitemap_fetch_loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(sitemap_fetch_loop)
                     try:
-                        # Create a temporary session just for parsing sitemaps
-                        # This avoids conflict if checker_instance is already in use or not set up
-                        temp_connector = aiohttp.TCPConnector(ssl=False)
-                        async with aiohttp.ClientSession(connector=temp_connector, headers={"User-Agent": user_agent}) as sitemap_session:
-                            all_urls_from_sitemaps = await process_sitemaps(
+                        # Use the new async helper for fetching sitemap URLs
+                        all_urls_from_sitemaps = sitemap_fetch_loop.run_until_complete(
+                            fetch_and_process_sitemap_urls(
                                 sitemap_xml_urls,
-                                session=sitemap_session,
-                                show_partial_sitemap_callback=show_discovered_sitemap_urls_streamlit
+                                user_agent, # Pass the configured user_agent
+                                show_discovered_sitemap_urls_streamlit # Pass the Streamlit callback
                             )
-                        show_discovered_sitemap_urls_streamlit(all_urls_from_sitemaps) # Final update
+                        )
+                        # Callback show_discovered_sitemap_urls_streamlit is called inside fetch_and_process_sitemap_urls
                     except Exception as e_sitemap_proc:
                         st.error(f"Error processing sitemaps: {e_sitemap_proc}")
                         logging.error("Sitemap Processing Exception", exc_info=True)
-                        st.session_state['is_crawling'] = False # Stop if sitemap parsing fails
-                        # temp_session_loop.close() # Close loop here if error
-                        # return # Exit if sitemap processing fails
+                        sitemap_fetch_failed = True
                     finally:
-                        if not temp_session_loop.is_closed(): # Ensure loop is closed
-                             temp_session_loop.close()
+                        if not sitemap_fetch_loop.is_closed():
+                            sitemap_fetch_loop.close()
+                        # Reset to default event loop - Streamlit usually manages this.
+                        # asyncio.set_event_loop(asyncio.new_event_loop()) # Or some other default if needed
 
+                    if sitemap_fetch_failed:
+                        st.session_state['is_crawling'] = False
+                        st.session_state['crawl_done'] = True # End operation
+                        st.rerun() # Update UI
+                        # return # Exit from main() if sitemap fetch fails. Not standard in Streamlit main.
 
-                    if all_urls_from_sitemaps:
+                    # --- Phase 2: Crawl the Discovered URLs ---
+                    if not sitemap_fetch_failed and all_urls_from_sitemaps:
+                        st.session_state['crawl_op_id'] = f"{sitemap_op_id}_crawl" # Update op_id for crawling phase
                         progress_text_placeholder.info(f"Found {len(all_urls_from_sitemaps)} URLs. Starting crawl...")
+                        # Setup checker for crawling these URLs
                         checker = URLChecker(user_agent, concurrency, timeout_seconds, respect_robots)
-                        st.session_state['checker_instance'] = checker
+                        st.session_state['checker_instance'] = checker # Store for potential stop
                         crawl_loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(crawl_loop)
                         try:
@@ -1362,75 +1517,95 @@ def main():
                                 )
                             )
                             st.session_state['crawl_results'] = results
-                            st.session_state['crawl_done'] = True
-                            progress_text_placeholder.success(f"Sitemap crawl finished! Found {len(results)} results.")
-                        except Exception as e:
-                            st.error(f"Sitemap crawl failed: {e}")
-                            logging.error("Sitemap Crawl Exception", exc_info=True)
-                            st.session_state['crawl_done'] = True
+                            if not checker.is_stopped():
+                                progress_text_placeholder.success(f"Sitemap crawl finished! Found {len(results)} results.")
+                            else:
+                                progress_text_placeholder.warning(f"Sitemap crawl stopped. Collected {len(results)} results.")
+                        except Exception as e_crawl:
+                            st.error(f"Sitemap crawl (URL processing) failed: {e_crawl}")
+                            logging.error("Sitemap Crawl (URL processing) Exception", exc_info=True)
+                            progress_text_placeholder.error(f"Sitemap crawl failed: {e_crawl}")
                         finally:
                             crawl_loop.close()
                             st.session_state['is_crawling'] = False
+                            st.session_state['crawl_done'] = True
                             st.session_state['checker_instance'] = None
-                    else:
+                            st.rerun()
+                    elif not sitemap_fetch_failed: # No URLs found, but sitemap fetch itself didn't error
                         st.warning("No URLs found in the provided sitemaps to crawl.")
                         st.session_state['is_crawling'] = False
-                else:
+                        st.session_state['crawl_done'] = True # Mark as done
+                        st.rerun()
+                    # If sitemap_fetch_failed, state is already set to stop.
+
+                else: # No sitemap_xml_urls provided
                     st.warning("Please enter at least one Sitemap URL.")
 
 
     # --- Display final results and download/copy buttons ---
-    if st.session_state['crawl_done'] and st.session_state['crawl_results']:
-        final_df = pd.DataFrame(st.session_state['crawl_results'])
-        final_df_formatted = format_and_reorder_df(final_df)
-        results_table_placeholder.dataframe(final_df_formatted, height=500, use_container_width=True) # Show full final table
+    # This section runs if a crawl has completed (crawl_done is True)
+    if st.session_state.get('crawl_done') and not st.session_state.get('is_crawling'):
+        if st.session_state.get('crawl_results'):
+            final_df = pd.DataFrame(st.session_state['crawl_results'])
+            if not final_df.empty:
+                final_df_formatted = format_and_reorder_df(final_df)
+                results_table_placeholder.dataframe(final_df_formatted, height=500, use_container_width=True)
 
-        csv_data = final_df_formatted.to_csv(index=False, encoding='utf-8')
-        # Use bytes for download button, string for copy button
-        csv_bytes = csv_data.encode('utf-8')
+                csv_data = final_df_formatted.to_csv(index=False, encoding='utf-8')
+                csv_bytes = csv_data.encode('utf-8') # For download button
 
-        # download_buttons_placeholder holds the columns for the buttons
-        btn_col1, btn_col2 = download_buttons_placeholder.columns(2)
-        with btn_col1:
-            st.download_button(
-                label="📥 Download Results as CSV",
-                data=csv_bytes,
-                file_name=f"crawl_results_{st.session_state['current_crawl_mode'].lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv",
-                key="download_csv_final"
-            )
-        with btn_col2:
-            copy_button(csv_data, "📋 Copy as CSV", key="copy_csv_final") # Using st_copy.copy_button
+                btn_col1, btn_col2 = download_buttons_placeholder.columns(2)
+                btn_col1.download_button(
+                    label="📥 Download Results as CSV",
+                    data=csv_bytes,
+                    file_name=f"crawl_results_{st.session_state.get('current_crawl_mode','general').lower()}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    key=f"download_csv_final_{st.session_state.get('current_op_id')}" # Unique key
+                )
+                btn_col2.button("📋 Copy as CSV", key=f"copy_csv_dummy_{st.session_state.get('current_op_id')}", on_click=lambda: pyperclip.copy(csv_data) if 'pyperclip' in globals() else None)
+                # Replace dummy copy with st_copy.copy_button if preferred and works reliably
+                # copy_button(csv_data, "📋 Copy as CSV", key=f"copy_csv_final_{st.session_state.get('current_op_id')}")
+                # For now, using a lambda with pyperclip as st_copy might have issues with rerun.
+                # A more robust copy might involve JavaScript through st.components.v1 if st_copy is problematic.
+                # The simplest is just to use st_copy.copy_button directly:
+                # btn_col2.copy_button(csv_data, "📋 Copy as CSV", key=f"copy_csv_final_{st.session_state.get('current_op_id')}")
+                # Let's try st_copy directly as it's the intended library:
+                copy_button_placeholder = btn_col2.empty() # Create a placeholder for the copy button
+                copy_button_placeholder.copy_button(csv_data, "📋 Copy as CSV", key=f"copy_csv_final_{st.session_state.get('current_op_id', 'default_op')}")
 
-        # --- Summary Section ---
-        st.subheader("📊 Crawl Summary")
-        if not final_df_formatted.empty:
-            summary_cols = st.columns(3)
-            summary_cols[0].metric("Total URLs Processed", len(final_df_formatted))
 
-            # Indexable count
-            if 'Indexable' in final_df_formatted.columns:
-                 indexable_count = final_df_formatted[final_df_formatted['Indexable'].str.lower() == 'yes'].shape[0]
-                 summary_cols[1].metric("Indexable URLs", indexable_count)
+                # --- Summary Section ---
+                st.subheader("📊 Crawl Summary")
+                summary_cols = st.columns(3)
+                summary_cols[0].metric("Total URLs Processed", len(final_df_formatted), help="Includes all attempts, successful or failed.")
 
-            # HTTP 200 count
-            if 'Final_Status_Code' in final_df_formatted.columns:
-                http_200_count = final_df_formatted[final_df_formatted['Final_Status_Code'] == '200'].shape[0]
-                summary_cols[2].metric("HTTP 200 OK", http_200_count)
+                if 'Indexable' in final_df_formatted.columns:
+                    indexable_count = final_df_formatted[final_df_formatted['Indexable'].str.lower() == 'yes'].shape[0]
+                    summary_cols[1].metric("Indexable URLs", indexable_count)
+                else:
+                    summary_cols[1].metric("Indexable URLs", "N/A")
 
-            # Further summary details in expanders
-            with st.expander("Detailed Status Code Distribution"):
+
                 if 'Final_Status_Code' in final_df_formatted.columns:
-                    st.dataframe(final_df_formatted['Final_Status_Code'].value_counts().rename_axis('Status Code').reset_index(name='Count'))
-            with st.expander("Indexability Overview"):
-                if 'Indexable' in final_df_formatted.columns and 'Indexability Reason' in final_df_formatted.columns:
-                    st.dataframe(final_df_formatted.groupby(['Indexable', 'Indexability Reason']).size().reset_index(name='Count').sort_values(by='Count', ascending=False))
+                    # Ensure Final_Status_Code is string for comparison, to handle "Error", "Skipped" etc.
+                    http_200_count = final_df_formatted[final_df_formatted['Final_Status_Code'].astype(str) == '200'].shape[0]
+                    summary_cols[2].metric("HTTP 200 OK", http_200_count)
+                else:
+                    summary_cols[2].metric("HTTP 200 OK", "N/A")
 
-        else:
-            st.info("No results to summarize.")
 
-    elif st.session_state['crawl_done'] and not st.session_state['crawl_results']:
-        results_table_placeholder.info("Crawl finished, but no results were collected.")
+                with st.expander("Detailed Status Code Distribution", expanded=False):
+                    if 'Final_Status_Code' in final_df_formatted.columns:
+                        st.dataframe(final_df_formatted['Final_Status_Code'].value_counts(dropna=False).rename_axis('Status Code').reset_index(name='Count'))
+                with st.expander("Indexability Overview", expanded=False):
+                    if 'Indexable' in final_df_formatted.columns and 'Indexability Reason' in final_df_formatted.columns:
+                        st.dataframe(final_df_formatted.groupby(['Indexable', 'Indexability Reason'], dropna=False).size().reset_index(name='Count').sort_values(by='Count', ascending=False))
+            else: # DataFrame is empty
+                results_table_placeholder.info("Crawl completed, but the results DataFrame is empty.")
+                download_buttons_placeholder.empty() # Clear buttons if no data
+        else: # No crawl_results in session state
+            results_table_placeholder.info("Crawl finished, but no results were collected or an error occurred.")
+            download_buttons_placeholder.empty() # Clear buttons
 
 
 if __name__ == "__main__":
