@@ -22,7 +22,6 @@ from urllib import robotparser
 import concurrent.futures
 import platform
 import numpy as np
-from scipy import stats
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
