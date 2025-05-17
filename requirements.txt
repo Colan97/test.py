@@ -1,0 +1,14 @@
+streamlit
+pandas
+aiohttp
+beautifulsoup4
+lxml
+certifi
+pyperclip
+st-copy
+orjson
+rich
+nest_asyncio
+tenacity
+tqdm
+colorama
