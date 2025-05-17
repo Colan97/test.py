@@ -21,7 +21,6 @@ import time
 from urllib import robotparser
 import concurrent.futures
 import platform
-import psutil
 import numpy as np
 from scipy import stats
 from rich.console import Console
